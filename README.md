@@ -75,18 +75,17 @@ Modify the UFW configuration file `/etc/ufw/after.rules` and add the following r
     :DOCKER-USER - [0:0]
     -A DOCKER-USER -j ufw-user-forward
 
+    -A DOCKER-USER -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN
+    -A DOCKER-USER -m conntrack --ctstate INVALID -j DROP
+    -A DOCKER-USER -i docker0 -o docker0 -j ACCEPT
+
     -A DOCKER-USER -j RETURN -s 10.0.0.0/8
     -A DOCKER-USER -j RETURN -s 172.16.0.0/12
     -A DOCKER-USER -j RETURN -s 192.168.0.0/16
 
-    -A DOCKER-USER -p udp -m udp --sport 53 --dport 1024:65535 -j RETURN
-
-    -A DOCKER-USER -j ufw-docker-logging-deny -p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN -d 192.168.0.0/16
-    -A DOCKER-USER -j ufw-docker-logging-deny -p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN -d 10.0.0.0/8
-    -A DOCKER-USER -j ufw-docker-logging-deny -p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN -d 172.16.0.0/12
-    -A DOCKER-USER -j ufw-docker-logging-deny -p udp -m udp --dport 0:32767 -d 192.168.0.0/16
-    -A DOCKER-USER -j ufw-docker-logging-deny -p udp -m udp --dport 0:32767 -d 10.0.0.0/8
-    -A DOCKER-USER -j ufw-docker-logging-deny -p udp -m udp --dport 0:32767 -d 172.16.0.0/12
+    -A DOCKER-USER -j ufw-docker-logging-deny -m conntrack --ctstate NEW -d 10.0.0.0/8
+    -A DOCKER-USER -j ufw-docker-logging-deny -m conntrack --ctstate NEW -d 172.16.0.0/12
+    -A DOCKER-USER -j ufw-docker-logging-deny -m conntrack --ctstate NEW -d 192.168.0.0/16
 
     -A DOCKER-USER -j RETURN
 
@@ -120,19 +119,65 @@ Similarly, if only for a specific container, such as IP address `172.17.0.2`:
 
 ## How it works?
 
+The following rules allow UFW to manage whether the public networks are allowed to visit the services provided by the Docker container. So that we can manage all firewall rules in one place.
+
+    -A DOCKER-USER -j ufw-user-forward
+
 The following rules allow the private networks to be able to visit each other. Normally, private networks are more trusted than public networks.
 
     -A DOCKER-USER -j RETURN -s 10.0.0.0/8
     -A DOCKER-USER -j RETURN -s 172.16.0.0/12
     -A DOCKER-USER -j RETURN -s 192.168.0.0/16
 
-The following rules allow UFW to manage whether the public networks are allowed to visit the services provided by the Docker container. So that we can manage all firewall rules in one place.
+The following rules allow established and related connections, so that return traffic is accepted.
 
+    -A DOCKER-USER -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN
+
+The following rules allow internal Docker communication (e.g. between containers on the default bridge).
+
+    -A DOCKER-USER -i docker0 -o docker0 -j ACCEPT
+
+The following rules block connection requests initiated by all public networks, but allow internal networks to access external networks.
+
+    -A DOCKER-USER -j ufw-docker-logging-deny -m conntrack --ctstate NEW -d 10.0.0.0/8
+    -A DOCKER-USER -j ufw-docker-logging-deny -m conntrack --ctstate NEW -d 172.16.0.0/12
+    -A DOCKER-USER -j ufw-docker-logging-deny -m conntrack --ctstate NEW -d 192.168.0.0/16
+
+## Legacy Solution (without conntrack)
+
+If you are using an older kernel or prefer the old solution, you can use the following rules.
+
+Modify the UFW configuration file `/etc/ufw/after.rules` and add the following rules at the end of the file:
+
+    # BEGIN UFW AND DOCKER
+    *filter
+    :ufw-user-forward - [0:0]
+    :ufw-docker-logging-deny - [0:0]
+    :DOCKER-USER - [0:0]
     -A DOCKER-USER -j ufw-user-forward
 
-For example, we want to block all outgoing connections from inside a container whose IP address is 172.17.0.9 which means to block this container to access internet or external networks. Using the following command:
+    -A DOCKER-USER -j RETURN -s 10.0.0.0/8
+    -A DOCKER-USER -j RETURN -s 172.16.0.0/12
+    -A DOCKER-USER -j RETURN -s 192.168.0.0/16
 
-    ufw route deny from 172.17.0.9 to any
+    -A DOCKER-USER -p udp -m udp --sport 53 --dport 1024:65535 -j RETURN
+
+    -A DOCKER-USER -j ufw-docker-logging-deny -p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN -d 192.168.0.0/16
+    -A DOCKER-USER -j ufw-docker-logging-deny -p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN -d 10.0.0.0/8
+    -A DOCKER-USER -j ufw-docker-logging-deny -p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN -d 172.16.0.0/12
+    -A DOCKER-USER -j ufw-docker-logging-deny -p udp -m udp --dport 0:32767 -d 192.168.0.0/16
+    -A DOCKER-USER -j ufw-docker-logging-deny -p udp -m udp --dport 0:32767 -d 10.0.0.0/8
+    -A DOCKER-USER -j ufw-docker-logging-deny -p udp -m udp --dport 0:32767 -d 172.16.0.0/12
+
+    -A DOCKER-USER -j RETURN
+
+    -A ufw-docker-logging-deny -m limit --limit 3/min --limit-burst 10 -j LOG --log-prefix "[UFW DOCKER BLOCK] "
+    -A ufw-docker-logging-deny -j DROP
+
+    COMMIT
+    # END UFW AND DOCKER
+
+### How it works (Legacy)
 
 The following rules block connection requests initiated by all public networks, but allow internal networks to access external networks. For TCP protocol, it prevents from actively establishing a TCP connection from public networks. For UDP protocol, all accesses to ports which is less then 32767 are blocked. Why is this port? Since the UDP protocol is stateless, it is not possible to block the handshake signal that initiates the connection request as TCP does. For GNU/Linux we can find the local port range in the file `/proc/sys/net/ipv4/ip_local_port_range`. The default range is `32768 60999`. When accessing a UDP protocol service from a running container, the local port will be randomly selected one from the port range, and the server will return the data to this random port. Therefore, we can assume that the listening port of the UDP protocol inside all containers are less then `32768`. This is the reason that we don't want public networks to access the UDP ports that less then `32768`.
 
@@ -267,6 +312,16 @@ This option applies to both IPv4 and IPv6 networks.
 
 You can use the same options with `ufw-docker check` to preview the changes before applying them.
 
+### Using the `--system` option
+
+If you want to install the `ufw-docker` script and the man page to the system, you can use the `--system` option.
+
+    ufw-docker install --system
+
+This command will:
+- Install the `ufw-docker` script to `/usr/local/bin/ufw-docker`
+- Install the man page to `/usr/local/man/man8/ufw-docker.8`
+
 #### Install for Docker Swarm mode
 
 We can only use this script on manager nodes to manage firewall rules when using in Swarm mode.
@@ -281,6 +336,10 @@ Running in Docker Swarm mode, this script will add a global service `ufw-docker-
 Show help
 
     ufw-docker help
+
+Show the man page
+
+    ufw-docker man
 
 Check the installation of firewall rules in UFW configurations
 
@@ -338,6 +397,8 @@ Remove rules from all nodes related to the service `web`
 
     ufw-docker service delete allow web
 
+    ufw-docker service delete allow web 80/tcp
+
 ### Try it out
 
 We use [Vagrant](https://www.vagrantup.com/) to set up a local testing environment.
@@ -365,6 +426,22 @@ On the master node, run the command to allow the public access port `80` of the 
 We can access the `web` service from our host now
 
     curl "http://192.168.56.13{0,1,2}:8080"
+
+## Running Tests
+
+This project uses [Vagrant](https://www.vagrantup.com/) to provision the testing environment. It will start 4 nodes: one master, two worker nodes, and one node to simulate external network access. The Ubuntu and Docker versions in the Vagrantfile are read from the Dockerfile.
+
+The unit tests use the [Bach Unit Testing Framework](https://bach.sh). You can run the tests using `./test.sh` or by running the test case files in the `test` directory directly.
+
+If you encounter any issues, please use the Vagrantfile to reproduce the problem.
+
+IPv6 is disabled by default. You can enable it by running:
+
+    env ENABLE_DOCKER_IPV6=true vagrant up
+
+You can also specify a local Docker registry mirror using `DOCKER_REGISTRY_MIRROR`:
+
+    env DOCKER_REGISTRY_MIRROR=http://192.168.1.100:5000 vagrant up
 
 ## Discussions
 
@@ -437,18 +514,17 @@ UFW 是 Ubuntu 上很流行的一个 iptables 前端，可以非常方便的管�
     :DOCKER-USER - [0:0]
     -A DOCKER-USER -j ufw-user-forward
 
+    -A DOCKER-USER -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN
+    -A DOCKER-USER -m conntrack --ctstate INVALID -j DROP
+    -A DOCKER-USER -i docker0 -o docker0 -j ACCEPT
+
     -A DOCKER-USER -j RETURN -s 10.0.0.0/8
     -A DOCKER-USER -j RETURN -s 172.16.0.0/12
     -A DOCKER-USER -j RETURN -s 192.168.0.0/16
 
-    -A DOCKER-USER -p udp -m udp --sport 53 --dport 1024:65535 -j RETURN
-
-    -A DOCKER-USER -j ufw-docker-logging-deny -p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN -d 192.168.0.0/16
-    -A DOCKER-USER -j ufw-docker-logging-deny -p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN -d 10.0.0.0/8
-    -A DOCKER-USER -j ufw-docker-logging-deny -p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN -d 172.16.0.0/12
-    -A DOCKER-USER -j ufw-docker-logging-deny -p udp -m udp --dport 0:32767 -d 192.168.0.0/16
-    -A DOCKER-USER -j ufw-docker-logging-deny -p udp -m udp --dport 0:32767 -d 10.0.0.0/8
-    -A DOCKER-USER -j ufw-docker-logging-deny -p udp -m udp --dport 0:32767 -d 172.16.0.0/12
+    -A DOCKER-USER -j ufw-docker-logging-deny -m conntrack --ctstate NEW -d 10.0.0.0/8
+    -A DOCKER-USER -j ufw-docker-logging-deny -m conntrack --ctstate NEW -d 172.16.0.0/12
+    -A DOCKER-USER -j ufw-docker-logging-deny -m conntrack --ctstate NEW -d 192.168.0.0/16
 
     -A DOCKER-USER -j RETURN
 
@@ -492,9 +568,55 @@ UFW 是 Ubuntu 上很流行的一个 iptables 前端，可以非常方便的管�
 
     -A DOCKER-USER -j ufw-user-forward
 
-例如，我们要阻止一个 IP 地址为 172.17.0.9 的容器内的所有对外连接，也就是阻止该容器访问外部网络，使用下列命令
+下面的规则允许已建立的连接和相关连接，以便返回流量被接受。
 
-    ufw route deny from 172.17.0.9 to any
+    -A DOCKER-USER -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN
+
+下面的规则允许 Docker 内部通信（例如默认网桥上的容器之间）。
+
+    -A DOCKER-USER -i docker0 -o docker0 -j ACCEPT
+
+下面的规则阻止了所有外部网络发起的连接请求，但是允许内部网络访问外部网络。
+
+    -A DOCKER-USER -j ufw-docker-logging-deny -m conntrack --ctstate NEW -d 10.0.0.0/8
+    -A DOCKER-USER -j ufw-docker-logging-deny -m conntrack --ctstate NEW -d 172.16.0.0/12
+    -A DOCKER-USER -j ufw-docker-logging-deny -m conntrack --ctstate NEW -d 192.168.0.0/16
+
+### 旧的解决方案（不使用 conntrack）
+
+如果您使用的是较旧的内核或更喜欢旧的解决方案，可以使用以下规则。
+
+修改 UFW 的配置文件 `/etc/ufw/after.rules`，在最后添加上如下规则：
+
+    # BEGIN UFW AND DOCKER
+    *filter
+    :ufw-user-forward - [0:0]
+    :ufw-docker-logging-deny - [0:0]
+    :DOCKER-USER - [0:0]
+    -A DOCKER-USER -j ufw-user-forward
+
+    -A DOCKER-USER -j RETURN -s 10.0.0.0/8
+    -A DOCKER-USER -j RETURN -s 172.16.0.0/12
+    -A DOCKER-USER -j RETURN -s 192.168.0.0/16
+
+    -A DOCKER-USER -p udp -m udp --sport 53 --dport 1024:65535 -j RETURN
+
+    -A DOCKER-USER -j ufw-docker-logging-deny -p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN -d 192.168.0.0/16
+    -A DOCKER-USER -j ufw-docker-logging-deny -p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN -d 10.0.0.0/8
+    -A DOCKER-USER -j ufw-docker-logging-deny -p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN -d 172.16.0.0/12
+    -A DOCKER-USER -j ufw-docker-logging-deny -p udp -m udp --dport 0:32767 -d 192.168.0.0/16
+    -A DOCKER-USER -j ufw-docker-logging-deny -p udp -m udp --dport 0:32767 -d 10.0.0.0/8
+    -A DOCKER-USER -j ufw-docker-logging-deny -p udp -m udp --dport 0:32767 -d 172.16.0.0/12
+
+    -A DOCKER-USER -j RETURN
+
+    -A ufw-docker-logging-deny -m limit --limit 3/min --limit-burst 10 -j LOG --log-prefix "[UFW DOCKER BLOCK] "
+    -A ufw-docker-logging-deny -j DROP
+
+    COMMIT
+    # END UFW AND DOCKER
+
+### 解释（旧方案）
 
 下面的规则阻止了所有外部网络发起的连接请求，但是允许内部网络访问外部网络。对于 TCP 协议，是阻止了从外部网络主动建立 TCP 连接。对于 UDP，是阻止了所有小余端口 `32767` 的访问。为什么是这个端口的？由于 UDP 协议是无状态的，无法像 TCP 那样阻止发起建立连接请求的握手信号。在 GNU/Linux 上查看文件 `/proc/sys/net/ipv4/ip_local_port_range` 可以看到发出 TCP/UDP 数据后，本地源端口的范围，默认为 `32768 60999`。当从一个运行的容器对外访问一个 UDP 协议的服务时，本地端口将会从这个端口范围里面随机选择一个，服务器将会把数据返回到这个随机端口上。所以，我们可以假定所有容器内部的 UDP 协议的监听端口都小余 `32768`，不允许外部网络主动连接小余 `32768` 的 UDP 端口。
 
@@ -619,6 +741,16 @@ UFW 是 Ubuntu 上很流行的一个 iptables 前端，可以非常方便的管�
     # 仅允许这些指定的子网与 Docker 容器通信
     ufw-docker install --docker-subnets 192.168.207.0/24 10.207.0.0/16 fd00:cf::/64
 
+### 使用 `--system` 选项
+
+如果你希望把 `ufw-docker` 脚本和 man page 安装到系统中，可以使用 `--system` 选项。
+
+    ufw-docker install --system
+
+这个命令将会：
+- 安装 `ufw-docker` 脚本到 `/usr/local/bin/ufw-docker`
+- 安装 man page 到 `/usr/local/man/man8/ufw-docker.8`
+
 #### 为 Docker Swarm 环境安装
 
 仅仅可以在管理节点上使用 `ufw-docker` 这个脚本来管理防火墙规则。
@@ -633,6 +765,10 @@ UFW 是 Ubuntu 上很流行的一个 iptables 前端，可以非常方便的管�
 显示帮助
 
     ufw-docker help
+
+显示 man page
+
+    ufw-docker man
 
 检查 UFW 配置文件中防火墙规则的安装
 
@@ -715,6 +851,22 @@ UFW 是 Ubuntu 上很流行的一个 iptables 前端，可以非常方便的管�
 现在我们可以在我们的主机上访问这个 `web` 服务了
 
     curl "http://192.168.56.13{0,1,2}:8080"
+
+## 运行测试
+
+本项目使用 [Vagrant](https://www.vagrantup.com/) 来准备测试环境。它会启动 4 个节点：一个 master，两个 worker 节点，以及一个用于模拟外部网络访问的节点。Vagrantfile 中的 Ubuntu 和 Docker 版本是从 Dockerfile 中读取的。
+
+单元测试使用的是 [Bach Unit Testing Framework](https://bach.sh)。你可以使用 `./test.sh` 来运行测试，或者直接运行 `test` 目录中的测试用例文件。
+
+如果你遇到了问题，请使用 Vagrantfile 来重现问题。
+
+IPv6 默认是禁用的。你可以通过以下命令来启用它：
+
+    env ENABLE_DOCKER_IPV6=true vagrant up
+
+你还可以使用 `DOCKER_REGISTRY_MIRROR` 来指定本地的 Docker registry 镜像地址：
+
+    env DOCKER_REGISTRY_MIRROR=http://192.168.1.100:5000 vagrant up
 
 ## 讨论
 
